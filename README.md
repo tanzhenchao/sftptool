@@ -5,7 +5,7 @@
 请参阅本人博客SFTP部署文档，https://www.cmdschool.org/archives/15658
 
 # 工具的使用方法
-wget https://raw.githubusercontent.com/tanzhenchao/sftptool/main/sftptool.sh
-mv sftptool.sh /usr/bin/sftptool
-sftptool
-Usage: /usr/bin/sftptool {user|home|ca|quota|ldap|backup}
+wget https://raw.githubusercontent.com/tanzhenchao/sftptool/main/sftptool.sh  
+mv sftptool.sh /usr/bin/sftptool  
+sftptool  
+Usage: /usr/bin/sftptool {user|home|ca|quota|ldap|backup}  

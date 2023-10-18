@@ -985,7 +985,7 @@ expireUserCA() {
 			exit 1
 		fi
 		sed -i "s/$infoJrNumber/$jrNumber/g" "$sftpUserInfo"
-		expireTime=`date -d "$infoExpire" +%s`
+		expireTime=`date -d "$infoExpires" +%s`
 		currentTime=`date -d "$nowTime" +%s`
 		if [ "$currentTime" -gt "$expireTime" -a "$sftpCMD"=="+" ]; then
 			newExpires=`date -d "$sftpCMD day $nowTime" +"%Y-%m-%d %H:%M:%S"`

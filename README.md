@@ -7,7 +7,7 @@
 # 工具的使用方法
 dnf install -y putty bc expect bzip2 postfix mailx openldap-clients autofs  
 wget https://raw.githubusercontent.com/tanzhenchao/sftptool/main/sftptool.sh  
-mv sftptool.sh /usr/bin/sftptool  
+mv sftptool.sh /bin/sftptool  
 chmod +x /bin/sftptool  
 sftptool  
 Usage: /usr/bin/sftptool {user|home|ca|quota|ldap|backup}

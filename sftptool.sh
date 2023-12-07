@@ -582,6 +582,7 @@ addUserHome() {
 	chown root:root "$sftpUserRootDir"
 	chmod -R 755 "$sftpUserRootDir"
 	chown "$sftpAccountName":"$sftpGroupName" "$sftpUserHomeDir"
+ 	chmod -R 775 "$sftpUserHomeDir"
         if [ -d $sftpUserHomeDir ]; then
 		changeMsg='addUserHome "''jr:'"$jrNumber"' account:'"$sftpAccountName"' home:'"$sftpUserHomeDir"'"'
 		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi

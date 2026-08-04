@@ -18,7 +18,7 @@
 重要说明：工具源码下载地址为境外链接，当前无法正常访问，可等待链接恢复后执行以下完整部署命令，完成工具安装、权限配置、配置文件部署：
 ~~~
 # wget https://codeload.github.com/tanzhenchao/sftptool/zip/refs/heads/for-ad-user -O sftptool-for-ad-user.zip
-# unzip sftptool-for-ad-user
+# unzip sftptool-for-ad-user.zip
 # mv sftptool-for-ad-user/sftptool.sh /bin/sftptool
 # chmod +x /bin/sftptool
 # mkdir -p /etc/sftp

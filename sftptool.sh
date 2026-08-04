@@ -2,32 +2,8 @@
 
 source /etc/profile
 
-authorizedKeysRootDir="/etc/ssh/sftpd_authorized_keys"
-authorizedKeysName="authorized_keys"
-sftpDataDir="/data/sftp"
-mailBox="/var/mail"
-mailFrom="sftpService@cmdschool.org"
-logAudit="/var/log/audit/audit.log"
-logAlert="/var/log/sftp/alert.log"
-logChange="/var/log/sftp/change.log"
-logMessage="/var/log/sftp/message.log"
-logDisable=true
-backupDir="/backup/sftp"
-quotaPath="/dev/mapper/ds-data"
-sftpGroupName="sftponly"
-sftpHomeName="myhome"
-sftpUserInfoFileName="userInfo"
-defaultQuota="8GB"
-ldapHost="ldapServer.cmdschool.org"
-ldapPort="389"
-ldapBindDN="uid=directory manager,ou=People,dc=cmdschool,dc=org"
-ldapPasswd="cn=directory manager password"
-ldapBaseDN="ou=people,dc=cmdschool,dc=org"
-defaultExpires="180"
-alertDays="30"
-alertFrequency="10"
-autoMastConf="/etc/auto.master"
-autoSftpConf="/etc/auto.sftp"
+config="/etc/sftp/sftptool.conf"
+source "$config"
 
 parameter1="$3"
 parameter2="$4"
@@ -64,34 +40,167 @@ checkMailRule() {
 	fi
 }
 
+loginCheck() {
+	userName="$1"
+
+	## Refresh the user's cache data
+	sss_cache -E
+
+	## Determine if it is a valid user
+	id "$userName" &> /dev/null
+	if [ "$?" -ne "0" ]; then
+		changeMsg="The system cannot find the user '$userName'."
+		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" | tee -a "$logMessage"; fi
+		return 1
+	fi
+
+	## If it is a system user with a UID less than 1000, the program exits
+	userUid=$(id -u "$userName")
+	if [ "$userUid" -lt "1000" ]; then
+		changeMsg="System user '"$userName"' with UID less than 1000 is not allowed to login."
+		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" | tee -a "$logMessage"; fi
+		return 1
+	fi
+
+	## Check if the user is a domain user, otherwise exit
+	if [ `id "$userName" | grep "domain users" | wc -l` -eq 0 ]; then
+		changeMsg="Non-domain user '"$userName"' is not allowed to login."
+		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" | tee -a "$logMessage"; fi
+		return 1
+	fi
+	return 0
+}
+
+userFormat() {
+	userName="$1"
+
+	## Determine if the input username format meets the requirements, otherwise exit
+	formatMark=0
+	echo "$userName" | egrep '.*@.*' &> /dev/null
+	if [ "$?" -eq "0" ]; then
+		formatMark=1
+	fi
+	echo "$userName" | egrep '.*\\.*' &> /dev/null
+	if [ "$?" -eq "0" ]; then
+		formatMark=2
+	fi
+	if [ "$formatMark" -eq "0" ]; then
+		changeMsg="The login user '"$userName"' account format does not meet the requirements."
+		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" | tee -a "$logMessage"; fi
+		return 1
+	fi
+
+	## Convert the input username format to the standard format
+	userName="$(echo $userName | awk '{print tolower($0)}')"
+	if [ "$formatMark" -eq "2" ]; then
+		userName="$(echo "$userName" | awk -F '\' '{print $2"@"$1}')"
+	fi
+	echo "$userName"
+	return 0
+}
+
+formatQuota() {
+    inputQuota=$1
+
+    num=$(echo "$inputQuota" | tr -cd '[0-9].')
+    var=$(echo "$inputQuota" | tr -d '[0-9].')
+
+    case "$var" in
+        [kK]|[kK][bB])
+            outputQuota=$(echo "$num" | bc)
+            ;;
+        [mM]|[mM][bB])
+            outputQuota=$(echo "$num * 1024" | bc)
+            ;;
+        [gG]|[gG][bB])
+            outputQuota=$(echo "$num * 1024 * 1024" | bc)
+            ;;
+        [tT]|[tT][bB])
+            outputQuota=$(echo "$num * 1024 * 1024 * 1024" | bc)
+            ;;
+        *)
+            echo "Invalid Quota format!"
+            exit 1
+            ;;
+    esac
+
+    echo "$outputQuota"
+}
+
+addShareFile() {
+	sftpAccountName="$(userFormat $parameter1)"
+
+	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
+        if [ -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+                return 0
+        fi
+
+	cat > "$sftpUserRootDir"'/'"$shareFileName" <<-EOF
+	# The current configuration file is used to set up the sharing of your "/myhome" directory with other sftp accounts to allow them to add, delete, modify and query your data.
+	# The configuration file will grant the corresponding permissions according to your current configuration after the user logs in again.
+
+	# PERMISSION MODE:
+	# - "rw" means that other sftp accounts are allowed to read, write and delete the contents of your shared directory.
+	# - "ro" means that other sftp accounts are only allowed to read the contents of your directory and are not allowed to modify or delete them.
+
+	# USE STEPS:
+	# Step1. Download the current example file to your local computer.
+	# Step2. Modify the configuration file according to the example.
+	# Step3. Upload and replace the current configuration.
+
+	# Example:
+	# cmdschool.org\xxxx rw
+	# cmdschool.com\xxxx ro
+
+	# NOTE:
+	# The content after the "#" symbol at the beginning of each line is a comment, so please do not include "#" symbols at the beginning of the configuration.
+	EOF
+        chown "$sftpAccountName":"$domainGroupName" "$sftpUserRootDir"'/'"$shareFileName"
+        chmod 600 "$sftpUserRootDir"'/'"$shareFileName"
+	changeMsg='addShareFile "'"jr:$jrNumber account:$sftpAccountName"'"'
+	if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
+}
+
 addUser() {
 	# Function implementation to add sftp new user.
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	endUserStaffNumber="$parameter3"
-	sftpPasswd="$parameter4"
-
-	if [ "$endUserStaffNumber" == "" ] || [ "$jrNumber" == "" ] || [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 user add <sftp account> <JR No.> <endUser staff No.> [sftp passwd]"
+	if [ "$parameter1" == "" ] || [ "$parameter2" == "" ]; then
+		echo "Usage: $0 user add <example.com\loginName> <JR No.> [user passwd]"
 		exit 1;
 	fi
 
-	endUserStaffNumber="`echo "$endUserStaffNumber" | tr 'a-z' 'A-Z'`"
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	sftpPasswd="$parameter3"
+
+	addLdapUserStatus="false"
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
+		userDomain=$(echo $sftpAccountName | cut -d "@" -f2)
+		if [ "${ldap[$userDomain.Editable]}" == "true" ]; then
+			addLdapUserStatus="true"
+		else
+			echo "Please create an AD user first"
+			exit 1
+		fi
+	else
+		userDomain=$(echo $sftpAccountName | cut -d "@" -f2)
+	fi
+	userName=$(echo $sftpAccountName | cut -d "@" -f1)
 
         sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
 	sftpUserInfo="$sftpUserKeysRootDir"'/'"$sftpUserInfoFileName"
 
-	userMail=`$0 ldap get "$endUserStaffNumber" "mail" | sed 's/mail: //g'`
-	abnormal="0"	
-	if ! checkMailRule "$userMail"; then
-		echo 'The format of the automatically obtained mail '"$userMail"' address is abnormal!'
-		abnormal="1"
+	if [ "$addLdapUserStatus" == "true" ]; then
+		read -p 'Please enter the mail address of user "'"$userName"'" :' userMail
+	else
+		userMail=`$0 ldap get userInfo "$sftpAccountName" "mail" | sed 's/mail: //g'`
+		if [ "$userMail" == "" ]; then
+			echo 'Please set email address for the domain user first!'
+			exit 1
+		fi
 	fi
-	if [ "$abnormal" == "1" ]; then
-		read -p 'Please enter the mail address of user "'"$endUserStaffNumber"'" :' userMail
-	fi
 	if ! checkMailRule "$userMail"; then
-		echo 'Email address "'$userMail'" does not meet the rules!'
+		echo 'The format of the automatically obtained mail "'"$userMail"'" address is abnormal!'
 		exit 1
 	fi
 
@@ -102,7 +211,7 @@ addUser() {
 	fi
 
 	echo '#------------------------------------------------'
-	echo 'End User Staff: '"$endUserStaffNumber"
+	echo 'End User Staff: '"$sftpAccountName"
 	echo 'End User Mail: '"$userMail"
 	echo 'JR: '"$jrNumber"
 	echo 'SFTP Account: '"$sftpAccountName"
@@ -123,13 +232,20 @@ addUser() {
 		esac
 	done
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 0 ]; then
-		echo 'User "'"$sftpAccountName"'" already exists!'
-		exit 1;
+	adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
+	if [ "$addLdapUserStatus" == "true" ]; then
+		if [ "$sftpPasswd" == "" ]; then
+			sftpPasswd=`mkpasswd-expect -l 10`
+		fi
+		echo "${ldap[$userDomain.Passwd]}" | adcli create-user -D "$userDomain" -U "$adminUserName" --mail="$userMail" --stdin-password "$userName"
 	fi
 
-	useradd "$sftpAccountName" -g "$sftpGroupName" -M -d '/'"$sftpHomeName" -s /bin/false
+	if [ $(id "$sftpAccountName" 2>&1 | grep "$sftpGroupName" | wc -l) == "0" ]; then
+		echo "${ldap[$userDomain.Passwd]}" | adcli add-member -D "$userDomain" -U "$adminUserName" --stdin-password "$sftpGroupName" "$userName"
+	fi
+
 	$0 home add "$sftpAccountName" "$jrNumber"
+	addShareFile "$sftpAccountName"
 	for ((;;)); do
 		echo ''
 		echo '#------------------------------------------------'
@@ -142,12 +258,14 @@ addUser() {
 	$0 ca add "$sftpAccountName" "$jrNumber"
 
 	expires=`date -d "+$defaultExpires day $nowTime" +"%Y-%m-%d %H:%M:%S"`
-	echo 'staff: '"$endUserStaffNumber" > "$sftpUserInfo"
+	echo 'staff: '"$sftpAccountName" > "$sftpUserInfo"
 	echo 'mail: '"$userMail" >> "$sftpUserInfo"
 	echo 'jr: '"$jrNumber" >> "$sftpUserInfo"
 	echo 'ctime: '"$nowTime" >> "$sftpUserInfo"
 	echo 'expires: '"$expires" >> "$sftpUserInfo"
-	$0 passwd reset "$sftpAccountName" "$jrNumber" "$sftpPasswd"
+	if [ "$addLdapUserStatus" == "true" ]; then
+		$0 passwd reset "$sftpAccountName" "$jrNumber" "$sftpPasswd"
+	fi
 	/usr/bin/chmod 600 "$sftpUserInfo"
 
         if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
@@ -155,18 +273,19 @@ addUser() {
 		exit 1
 	else
 		echo 'User "'"$sftpAccountName"'" was created successfully!'
-		changeMsg='addUser "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$endUserStaffNumber"' mail:'"$userMail"' expires:'"$expires"'"'
+		changeMsg='addUser "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$sftpAccountName"' mail:'"$userMail"' expires:'"$expires"'"'
 		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
 	fi
 	echo ''
 	echo 'User details see below,'
 	echo '#------------------------------------------------'
+
 	$0 user get "$sftpAccountName"
 	echo ''
 	echo '#------------------------------------------------'
 	for ((;;)); do
 		echo 'Please choose a login type,'
-		read -p 'Continue with (k/K) for key file authentication or (p/P) for password authentication(default key file): ' choice
+		read -p 'Continue with (k/K) for key file authentication or (p/P) for password authentication(default password): ' choice
 		case "$choice" in
 			k|K )
 				loginType="keyfile"
@@ -179,8 +298,8 @@ addUser() {
 				break
 				;;
 			"$Na" )
-				loginType="keyfile"
-				echo "Login Type: Key file"
+				loginType="password"
+				echo "Login Type: Username and password"
 				break
 		        	;;
 			* )
@@ -219,39 +338,36 @@ addUser() {
 
 getUser() {
 	# Function implementation to get user list
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
+	if [ "$parameter1" == "" ]; then
 		echo "Usage: $0 user get <list>"
-		echo "       $0 user get <sftp account>"
+		echo "       $0 user get <example.com\loginName>"
 		echo "       $0 user get <all>"
 		echo "       $0 user get <root>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 	sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
 	sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
 	sftpUserInfo="$sftpUserKeysRootDir"'/'"$sftpUserInfoFileName"
 	sftpUserKeysDir="$sftpUserKeysRootDir"'/.ssh'
 
-	if [ "$sftpAccountName" == "root" ]; then
+	if [ "$parameter1" == "root" ]; then
 		$0 home get root
 		$0 ca get root
 	fi
 
-	if [ "$sftpAccountName" == "list" ]; then
-		for i in `cat /etc/passwd | cut -d":" -f1`; do
-			if [ `id $i | grep "$sftpGroupName" | wc -l` = 0 ]; then
-				continue
-			fi
-			echo $i
-		done
+	if [ "$parameter1" == "list" ]; then
+		$0 ldap get sftpUsers cmdschool.org
+		$0 ldap get sftpUsers cmdschool.com
 	fi
 
-	if [ "$sftpAccountName" != "list" -a "$sftpAccountName" != "all" -a "$sftpAccountName" != "root" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" != "list" -a "$parameter1" != "all" -a "$parameter1" != "root" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 		userInfo=""
 		if [ -f "$sftpUserInfo" ]; then
@@ -271,8 +387,8 @@ getUser() {
 		$0 quota get "$sftpAccountName"
 	fi
 
-	if [ "$sftpAccountName" == "all" ]; then
-		for i in `$0 user get list`; do
+	if [ "$parameter1" == "all" ]; then
+		for i in $($0 user get list); do
 			$0 user get "$i"
 			echo
 		done
@@ -281,16 +397,17 @@ getUser() {
 
 delUser() {
 	# Function to delete user
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 user del <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 user del <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -343,7 +460,46 @@ delUser() {
 	for ((;;)); do
 		echo ''
 		echo '#------------------------------------------------'
-		read -p 'Remove system account of "'$sftpAccountName'", Continue (y/n)?' choice
+		read -p 'Remove AD user "'$sftpAccountName'" from Group "'$sftpGroupName'", Continue (y/n)?' choice
+		case "$choice" in 
+			y|Y )
+				echo "yes"
+				userDomain=$(echo $sftpAccountName | cut -d "@" -f2)
+				if [ $(id "$sftpAccountName" 2> /dev/null | grep "$sftpGroupName" | wc -l) != "0" ]; then
+					adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
+					userName=$(echo $sftpAccountName | cut -d "@" -f1)
+					echo "${ldap[$userDomain.Passwd]}" | adcli remove-member -D "$userDomain" -U "$adminUserName" --stdin-password "$sftpGroupName" "$userName"
+				fi
+				sss_cache -E
+				echo 'Successfully!'
+				changeMsg='delGroupMember "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$endUserStaffNumber"' mail:'"$userMail"' ctime:'"$ctime"' expires:'"$expires"'"'
+				if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
+				break
+		        	;;
+			n|N )
+				echo "no"
+				break
+				;;
+			* )
+				echo "invalid!"
+				continue
+				;;
+		esac
+	done
+	if [ "${ldap[$userDomain.Editable]}" == "false" ]; then
+		for ((;;)); do
+			if [ `pgrep -u "$sftpAccountName" sshd | wc -l` != 0 ]; then
+				for i in `pgrep -u "$sftpAccountName" sshd`; do kill $i; done
+				sleep 0.1
+			else
+				exit 0
+			fi
+		done
+	fi
+	for ((;;)); do
+		echo ''
+		echo '#------------------------------------------------'
+		read -p 'Remove ad account of "'$sftpAccountName'", Continue (y/n)?' choice
 		case "$choice" in 
 			y|Y )
 				echo "yes"
@@ -355,15 +511,15 @@ delUser() {
 						break
 					fi
 				done
-				userdel "$sftpAccountName"
-        			if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-					echo 'Successfully!'
-					changeMsg='delUser "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$endUserStaffNumber"' mail:'"$userMail"' ctime:'"$ctime"' expires:'"$expires"'"'
-					if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
-					exit 0
-				else
-					echo 'Failed, please try again!'
-				fi
+				userDomain=$(echo $sftpAccountName | cut -d "@" -f2)
+				adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
+				userName=$(echo $sftpAccountName | cut -d "@" -f1)
+				echo "${ldap[$userDomain.Passwd]}" | adcli delete-user -D "$userDomain" -U "$adminUserName" --stdin-password "$userName"
+				sss_cache -E
+				echo 'Successfully!'
+				changeMsg='delUser "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$endUserStaffNumber"' mail:'"$userMail"' ctime:'"$ctime"' expires:'"$expires"'"'
+				if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
+				break
 		        	;;
 			n|N )
 				echo "no"
@@ -380,14 +536,14 @@ delUser() {
 
 resetUserPasswd() {
 	#Function to add user password
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	sftpPasswd="$parameter3"
-
-	if [ "$jrNumber" == "" ] || [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 user add <sftp account> <JR No.> [sftp passwd]"
+	if [ "$parameter1" == "" ] || [ "$parameter2" == "" ]; then
+		echo "Usage: $0 passwd reset <example.com\loginName> <JR No.> [sftp passwd]"
 		exit 1;
 	fi
+
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	sftpPasswd="$parameter3"
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
 
@@ -399,25 +555,55 @@ resetUserPasswd() {
         sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
 	sftpUserInfo="$sftpUserKeysRootDir"'/'"$sftpUserInfoFileName"
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountName"'" first!'
-		exit 1;
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+		exit 1
+	fi
+
+	userDomain=$(echo $sftpAccountName | cut -d "@" -f2)
+	userName=$(echo $sftpAccountName | cut -d "@" -f1)
+	if [ "${ldap[$userDomain.Editable]}" = "false" ]; then
+		for ((;;)); do
+			read -p "User $sftpAccountName is a non-editable domain user, Continue (y/n)?" choice
+			case "$choice" in 
+				y|Y )
+					echo "yes"
+					break
+		        		;;
+				n|N )
+					echo "no"
+					exit 1
+					;;
+				* )
+					echo "invalid!"
+					;;
+			esac
+		done
 	fi
 
 	if [ "$sftpPasswd" == "" ]; then
-		sftpPasswd=`mkpasswd -l 10`
+		sftpPasswd=`mkpasswd-expect -l 10`
 	fi
-	echo "$sftpPasswd" | passwd --stdin "$sftpAccountName"
+	adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
+	expect <<-EOF
+	spawn adcli passwd-user -D "$userDomain" -U "$adminUserName" "$userName"
+	expect "Password"
+	send "${ldap[$userDomain.Passwd]}\r"
+	expect "Password"
+	send "${sftpPasswd}\r"
+	expect eof	
+	EOF
 
-	userPasswordSave=`cat "$sftpUserInfo" | grep "userPassword: " | sed 's/userPassword: //g'`
+	userPasswordSave=`cat "$sftpUserInfo" | grep "userInitialPassword: " | sed 's/userInitialPassword: //g'`
 	sftpPasswdSave=`echo "$sftpPasswd" | base64 -i`
 	if [ "$userPasswordSave" == "" ]; then
-		echo 'userPassword: '"$sftpPasswdSave" >> "$sftpUserInfo"
+		echo 'userInitialPassword: '"$sftpPasswdSave" >> "$sftpUserInfo"
 	else
 		sed -i "s/$userPasswordSave/$sftpPasswdSave/g" "$sftpUserInfo"		
 	fi
 
-	userPasswordSave=`cat "$sftpUserInfo" | grep "userPassword: " | sed 's/userPassword: //g'`
+	userPasswordSave=`cat "$sftpUserInfo" | grep "userInitialPassword: " | sed 's/userInitialPassword: //g'`
         if [ "$userPasswordSave" == "" ]; then
 		echo 'User "'"$sftpAccountName"'" password was created failed!'
 		exit 1
@@ -431,19 +617,19 @@ resetUserPasswd() {
 
 sendUserPasswd() {
 	#Function to send user password to user
-
-	sftpAccountName="$parameter1"
-	sftpUserName="$parameter2"
-	sftpUserMail="$parameter3"
-
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 passwd send <sftp account> [userName] [userMail]"
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 passwd send <example.com\loginName> [userName] [userMail]"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	sftpUserName="$parameter2"
+	sftpUserMail="$parameter3"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
@@ -476,21 +662,54 @@ sendUserPasswd() {
 		exit 1
 	fi
 	endUserStaffNumber=`cat "$sftpUserInfo" | grep "staff: " | sed 's/staff: //g'`
-	userName=`$0 ldap get "$endUserStaffNumber" cn | grep "cn: " | sed 's/cn: //g'`
-	userPasswordSave=`cat "$sftpUserInfo" | grep "userPassword: " | sed 's/userPassword: //g'`
-	userPassword=`echo "$userPasswordSave" | base64 -d`
+	userName=`$0 ldap get userInfo "$endUserStaffNumber" cn | grep "cn: " | sed 's/cn: //g'`
+	userPasswordSave=`cat "$sftpUserInfo" | grep "userInitialPassword: " | sed 's/userInitialPassword: //g'`
 
 	if [ "$userName" == "" ]; then
 		read -p 'Please enter user name of user "'"$sftpAccountName"'": ' var
 		userName="`echo $var | tr 'a-z' 'A-Z'`"
 	fi
 
-	shadowSalt=`grep "$sftpAccountName" /etc/shadow | cut -d":" -f2 | cut -d'$' -f3`
-	typePasswordHash=`echo "$userPassword" | openssl passwd -6 -stdin -salt "$shadowSalt"`
-	shadowPasswordHash=`grep "$sftpAccountName" /etc/shadow | cut -d":" -f2`
-	if [ "$typePasswordHash" != "$shadowPasswordHash" ]; then
-		echo 'Sending User "'"$sftpAccountName"'" password not match OS password, please update and tryi again!'
-		exit 1
+	$0 ldap check "$sftpAccountName"
+	if [ "$?" != "0" ]; then
+		echo 'Sending User "'"$sftpAccountName"'" password not match ldap password!'
+		echo ''
+		for ((;;)); do
+			read -p "You need to reset the password for user $sftpAccountName, Continue (y/n)?" choice
+			case "$choice" in 
+				y|Y )
+					echo "yes"
+					$0 passwd reset "$sftpAccountName" "$jrNumber"
+					break
+		        		;;
+				n|N )
+					echo "no"
+					break
+					;;
+				* )
+					echo "invalid!"
+					;;
+			esac
+		done
+		for ((;;)); do
+			read -p "May I ask if user $sftpAccountName already has the password, Continue (y/n)?" choice
+			case "$choice" in 
+				y|Y )
+					echo "yes"
+					userPassword='<Computer Login Password>'
+					break
+		        		;;
+				n|N )
+					echo "no"
+					exit 1
+					;;
+				* )
+					echo "invalid!"
+					;;
+			esac
+		done
+	else
+		userPassword=`echo "$userPasswordSave" | base64 -d`
 	fi
 
 	echo ''
@@ -516,13 +735,13 @@ sendUserPasswd() {
 		esac
 	done
 
-	mailSubject='[SFTP Service] SFTP account is ready – ['"$jrNumber"']'
+	mailSubject='[CMDSCHOOL SFTP] SFTP account is ready – ['"$jrNumber"']'
 	cat <<-EOF | mail -s "$mailSubject" -r "$mailFrom" "$mailTo"
 	Dear $userName
 
 	The SFTP account has been successfully created with the JR:$jrNumber. Please use the below username and password for SFTP services and keep confidential.
 
-	Username: $sftpAccountName
+	Username: $(echo "$sftpAccountName" | awk -F '@' '{print $2 "\\" $1}')
 	Password: $userPassword
 
 	Please refer to the detailed User Guide below.
@@ -530,9 +749,9 @@ sendUserPasswd() {
 	https://pvtcloud.cmdschool.org/index.php/s/dx7ry7LFaStADDc
 
 	You may contact IT HelpDesk, if you need further assistance or queries. 
-	IT Helpdesk: (xx) xxxx
+	HK IT Helpdesk: (31) 8222; D2 IT Helpdesk: (32)2998; CA IT Helpdesk: (33)7998
 
-	Note: This email is an automatically generated email from [SFTP Service], please do not respond to this email, and delete immediately after saving the credentials!
+	Note: This email is an automatically generated email from [CMDSCHOOL SFTP], please do not respond to this email, and delete immediately after saving the credentials!
 
 	EOF
 	if [ "$?" == "0" ]; then
@@ -545,17 +764,18 @@ sendUserPasswd() {
 
 addUserHome() {
 	# Function to create user home directory
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 home add <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 home add <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -573,16 +793,11 @@ addUserHome() {
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountName"'" first!'
-		exit 1;
-	fi
-
 	mkdir -p "$sftpUserHomeDir"
 	chown root:root "$sftpUserRootDir"
 	chmod -R 755 "$sftpUserRootDir"
-	chown "$sftpAccountName":"$sftpGroupName" "$sftpUserHomeDir"
- 	chmod -R 775 "$sftpUserHomeDir"
+	chown "$sftpAccountName":"$domainGroupName" "$sftpUserHomeDir"
+	chmod -R 775 "$sftpUserHomeDir"
         if [ -d $sftpUserHomeDir ]; then
 		changeMsg='addUserHome "''jr:'"$jrNumber"' account:'"$sftpAccountName"' home:'"$sftpUserHomeDir"'"'
 		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
@@ -591,19 +806,19 @@ addUserHome() {
 
 delUserHome() {
 	# Function to delete the user's home directory
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 home del <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter1" == "" ]]; then
+		echo "Usage: $0 home del <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
         if [ ! -d "$sftpUserRootDir" ]; then
@@ -621,7 +836,7 @@ delUserHome() {
 	case "$choice" in 
 		y|Y )
 			echo "yes"
-			$0 mount del "$sftpAccountName" all "$jrNumber"
+			$0 share del "$sftpAccountName" all "$jrNumber"
 			if [ -f "$mailBox"'/'"$sftpAccountName" ]; then
 				rm -f "$mailBox"'/'"$sftpAccountName"
 			fi
@@ -651,37 +866,38 @@ delUserHome() {
 
 getUserHome() {
 	# Function implementation to query user home directory
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
+	if [ "$parameter1" == "" ]; then
 		echo "Usage: $0 home get <list>"
-		echo "       $0 home get <sftp account>"
+		echo "       $0 home get <example.com\loginName>"
 		echo "       $0 home get <all>"
 		echo "       $0 home get <root>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 	sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
 
-	if [ "$sftpAccountName" == "root" ]; then
+	if [ "$parameter1" == "root" ]; then
 		echo 'Home Root Directory Path: '"$sftpDataDir"
 		echo 'Home Root Directory Space: '`du -sh "$sftpDataDir" | awk  -F ' '  '{print $1}'`
 	fi
 
-	if [ "$sftpAccountName" == "list" ]; then
+	if [ "$parameter1" == "list" ]; then
 		ls -d "$sftpDataDir"'/'*
 	fi
 
-	if [ "$sftpAccountName" != "root" -a "$sftpAccountName" != "list" -a "$sftpAccountName" != "all" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" != "root" -a "$parameter1" != "list" -a "$parameter1" != "all" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 		echo 'User Home Directory Path: '"$sftpUserHomeDir"
 		echo 'User Home Directory Space: '`du -sh "$sftpUserHomeDir" | awk  -F ' '  '{print $1}'`
 	fi
 
-	if [ "$sftpAccountName" == "all" ]; then
+	if [ "$parameter1" == "all" ]; then
 		for i in `$0 user get list`; do
 			$0 home get "$i"
 			echo
@@ -691,18 +907,19 @@ getUserHome() {
 
 addUserCA() {
 	# Function to create a user's certificate.
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	caPasswd="$parameter3"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 ca add <sftp account> <JR No.> [CA passwd]"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 ca add <example.com\loginName> <JR No.> [CA passwd]"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	caPasswd="$parameter3"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -720,13 +937,8 @@ addUserCA() {
                 exit 1;
         fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountName"'" first!'
-		exit 1;
-	fi
-
 	mkdir -p "$sftpUserKeysDir"
-	chown "$sftpAccountName":"$sftpGroupName" "$sftpUserKeysDir"
+	chown "$sftpAccountName":"$domainGroupName" "$sftpUserKeysDir"
 	chmod 700 "$sftpUserKeysDir"
 	cd "$sftpUserKeysDir"
 	if [ "$caPasswd" == "" ]; then	
@@ -736,7 +948,7 @@ addUserCA() {
 	fi
 	cat "$sftpAccountName"'_rsa.pub' > "$authorizedKeysName"
 	chmod 600 "$authorizedKeysName"
-	chown "$sftpAccountName":"$sftpGroupName" "$authorizedKeysName"
+	chown "$sftpAccountName":"$domainGroupName" "$authorizedKeysName"
 	echo "$caPasswd" > old-passphrase
 	puttygen --old-passphrase=old-passphrase -O private "$sftpAccountName"'_rsa' -o "$sftpAccountName"'_rsa.ppk'
 	puttygen --old-passphrase=old-passphrase -O private "$sftpAccountName"'_rsa' -o "$sftpAccountName"'_rsa_v2.ppk' --ppk-param version=2
@@ -760,17 +972,18 @@ addUserCA() {
 
 delUserCA() {
 	# Function to delete user certificate.
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 ca del <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 ca del <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'User '"$sftpAccountName"' certificate directory not found!'
-		exit 1;
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+		exit 1
 	fi
         if [ -d "$sftpUserKeysRootDir" ]; then
 		echo 'Certificate directory '"$sftpUserKeysRootDir"' does not exis!'
@@ -818,18 +1031,19 @@ delUserCA() {
 
 resetUserCA() {
 	#Function to delete the certificate and recreate it.
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	sftpPasswd="$parameter3"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 ca reset <sftp account> <JR No.> [sftp passwd]"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 ca reset <example.com\loginName> <JR No.> [sftp passwd]"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	sftpPasswd="$parameter3"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -846,33 +1060,34 @@ resetUserCA() {
 
 getUserCA() {
 	# Function implementation to get user certificate
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
+	if [ "$parameter1" == "" ]; then
 		echo "Usage: $0 ca get <list>"
-		echo "       $0 ca get <sftp account>"
+		echo "       $0 ca get <example.com\loginName>"
 		echo "       $0 ca get <all>"
 		echo "       $0 ca get <root>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 	sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
 	sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
 	sftpUserKeysDir="$sftpUserKeysRootDir"'/.ssh'
 
-	if [ "$sftpAccountName" == "root" ]; then
+	if [ "$parameter1" == "root" ]; then
 		echo 'Certificate Root Directory Path: '"$authorizedKeysRootDir"
 		echo 'Certificate Root Directory Space: '`du -sh "$authorizedKeysRootDir" | awk  -F ' '  '{print $1}'`
 	fi
 
-	if [ "$sftpAccountName" == "list" ]; then
+	if [ "$parameter1" == "list" ]; then
 		ls -d "$authorizedKeysRootDir"'/'*'/.ssh/'
 	fi
 
-	if [ "$sftpAccountName" != "list" -a "$sftpAccountName" != "root" -a "$sftpAccountName" != "all" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" != "list" -a "$parameter1" != "root" -a "$parameter1" != "all" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 		if [ -d "$sftpUserKeysDir" ]; then
 			echo 'Certificate Storage Directory: '"$sftpUserKeysDir"
@@ -887,7 +1102,7 @@ getUserCA() {
 		echo 'FileZilla Private Key Version 2: '"$sftpUserKeysDir"'/'"$sftpAccountName"'_rsa_v2.ppk'
 	fi
 
-	if [ "$sftpAccountName" == "all" ]; then
+	if [ "$parameter1" == "all" ]; then
 		for i in `$0 user get list`; do
 			$0 ca get "$i"
 			echo
@@ -897,32 +1112,30 @@ getUserCA() {
 
 expireUserCA() {
 	# Function to realize user certificate expiration date management
-	sftpAccountName="$parameter1"
-	sftpCMD="$parameter2"
-	endUserStaffNumber="$parameter3"
-	jrNumber="$parameter4"
-
-	if [[ "$sftpAccountName" == "" || "$sftpCMD" == "+"* || "$sftpCMD" == "-"* ]]; then
-		if [[ "$sftpAccountName" == "" || "$endUserStaffNumber" == "" || "$jrNumber" == "" ]]; then
-			echo "Usage: $0 ca expire <sftp account>"
-			echo "       $0 ca expire <sftp account> <+integer> <endUser staff No.> <JR No.>"
-			echo "       $0 ca expire <sftp account> <-integer> <endUser staff No.> <JR No.>"
-			echo "       $0 ca expire <sftp account> <check>"
-			echo "       $0 ca expire <sftp account> <flush>"
+	if [[ "$parameter1" == "" || "$parameter2" == "+"* || "$parameter2" == "-"* ]]; then
+		if [[ "$parameter1" == "" || "$parameter3" == "" ]]; then
+			echo "Usage: $0 ca expire <example.com\loginName>"
+			echo "       $0 ca expire <example.com\loginName> <+integer> <JR No.>"
+			echo "       $0 ca expire <example.com\loginName> <-integer> <JR No.>"
+			echo "       $0 ca expire <example.com\loginName> <check>"
+			echo "       $0 ca expire <example.com\loginName> <flush>"
 			echo "       $0 ca expire <all> <check>"
 			echo "       $0 ca expire <all> <flush>"
 			exit 1;
 		fi
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
+	sftpCMD="$parameter2"
+	jrNumber="$parameter3"
+
 	if [ "$sftpAccountName" != "all" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 	fi
-
-	endUserStaffNumber="`echo "$endUserStaffNumber" | tr 'a-z' 'A-Z'`"
 
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 	sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
@@ -931,7 +1144,7 @@ expireUserCA() {
 	sftpUserInfo="$sftpUserKeysRootDir"'/'"$sftpUserInfoFileName"
 
 	userInfo=""
-	if [ "$sftpAccountName" != "all" ]; then
+	if [ "$parameter1" != "all" ]; then
 		if [ -f "$sftpUserInfo" ]; then
 			userInfo=`cat "$sftpUserInfo"`
 		else
@@ -949,10 +1162,11 @@ expireUserCA() {
 
 
 	# show user ca expire
-	if [[ "$sftpAccountName" != "all" && "$sftpCMD" == "" && "$sftpCMD" != "+"* && "$sftpCMD" != "-"* ]]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [[ "$parameter1" != "all" && "$parameter2" == "" && "$parameter2" != "+"* && "$parameter2" != "-"* ]]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 		if [ ! -d "$sftpUserKeysDir" ]; then
 			echo 'Error: SFTP user CA directory '"$sftpUserKeysDir"' is lost, please fix it manually!'
@@ -961,15 +1175,15 @@ expireUserCA() {
 	fi
 
 	# edit user ca expire
-	if [[ "$sftpAccountName" != "all" && "$sftpCMD" == "+"* || "$sftpCMD" == "-"* ]]; then
-		userMail=`$0 ldap get "$endUserStaffNumber" "mail" | sed 's/mail: //g'`
+	if [[ "$parameter1" != "all" && "$parameter2" == "+"* || "$parameter2" == "-"* ]]; then
+		userMail=`$0 ldap get userInfo "$sftpAccountName" "mail" | sed 's/mail: //g'`
 		abnormal="0"	
 		if ! checkMailRule "$userMail"; then
 			echo 'The format of the automatically obtained mail '"$userMail"' address is abnormal!'
 			abnormal="1"
 		fi
 		if [ "$abnormal" == "1" ]; then
-			read -p 'Please enter the mail address of user "'"$endUserStaffNumber"'" :' userMail
+			read -p 'Please enter the mail address of user "'"$sftpAccountName"'" :' userMail
 		fi
 		if ! checkMailRule "$userMail"; then
 			echo 'Email address "'$userMail'" does not meet the rules!'
@@ -986,7 +1200,7 @@ expireUserCA() {
 			exit 1
 		fi
 		sed -i "s/$infoJrNumber/$jrNumber/g" "$sftpUserInfo"
-		expireTime=`date -d "$infoExpires" +%s`
+		expireTime=`date -d "$infoExpire" +%s`
 		currentTime=`date -d "$nowTime" +%s`
 		if [ "$currentTime" -gt "$expireTime" -a "$sftpCMD"=="+" ]; then
 			newExpires=`date -d "$sftpCMD day $nowTime" +"%Y-%m-%d %H:%M:%S"`
@@ -996,18 +1210,18 @@ expireUserCA() {
 		if [ "$infoExpires" != "$newExpires" ]; then
 			sed -i "s/$infoExpires/$newExpires/g" "$sftpUserInfo"
 		fi
-		if [ "$infoEndUserStaffNumber" != "$endUserStaffNumber" ]; then
-			sed -i "s/$infoEndUserStaffNumber/$endUserStaffNumber/g" "$sftpUserInfo"
+		if [ "$infoEndUserStaffNumber" != "$sftpAccountName" ]; then
+			sed -i "s/$infoEndUserStaffNumber/$sftpAccountName/g" "$sftpUserInfo"
 		fi
 		if [ "$infoUserMail" != "$userMail" ]; then
 			sed -i "s/$infoUserMail/$userMail/g" "$sftpUserInfo"
 		fi
 		$0 ca expire "$sftpAccountName"
-		changeMsg='expire-changeExpireUserCA "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$endUserStaffNumber"' mail:'"$userMail"' expires:'"$newExpires"'"'
+		changeMsg='expire-changeExpireUserCA "''jr:'"$jrNumber"' account:'"$sftpAccountName"' staff:'"$sftpAccountName"' mail:'"$userMail"' expires:'"$newExpires"'"'
 		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
 	fi
 
-	if [ "$sftpAccountName" != "all" -a "$sftpCMD" == "check" ]; then
+	if [ "$parameter1" != "all" -a "$parameter2" == "check" ]; then
 		if [ ! -f "$sftpUserInfo" ]; then
 			echo 'Could not find user user info file: '"$sftpUserInfo"
 			exit 1
@@ -1030,8 +1244,8 @@ expireUserCA() {
 			exit 0
 		fi
 
-		userName=`$0 ldap get "$infoEndUserStaffNumber" cn | grep "cn: " | sed 's/cn: //g'`
-		ldapUserMail=`$0 ldap get "$infoEndUserStaffNumber" mail | grep "mail: " | sed 's/mail: //g'`
+		userName=`$0 ldap get userInfo "$infoEndUserStaffNumber" cn | grep "cn: " | sed 's/cn: //g'`
+		ldapUserMail=`$0 ldap get userInfo "$infoEndUserStaffNumber" mail | grep "mail: " | sed 's/mail: //g'`
 
 		if [ "$infoUserMail" == "$ldapUserMail" ]; then
 			sftpUserMail="$infoUserMail"
@@ -1048,16 +1262,16 @@ expireUserCA() {
 			exit 1
 		fi
 
-		mailSubject='[SFTP Service] SFTP account extension notice'
+		mailSubject='[CMDSCHOOL SFTP] SFTP account extension notice'
 		cat <<-EOF | mail -s "$mailSubject" -r "$mailFrom" "$mailTo"
 		Dear $userName
 
 		Your SFTP account "$sftpAccountName" will expiry on $infoExpires. Please submit IT JR for account renewal if necessary. Otherwise the account will be disabled without any further notice. Thanks!
 
 		You may contact IT HelpDesk, if you need further assistance or queries. 
-		IT Helpdesk: (xx) xxxx
+		HK IT Helpdesk: (31) 8222; D2 IT Helpdesk: (32)2998; CA IT Helpdesk: (33)7998
 
-		Note: This email is an automatically generated email from [SFTP Service], please do not respond to this email.
+		Note: This email is an automatically generated email from [CMDSCHOOL SFTP], please do not respond to this email.
 		EOF
 		if [ "$?" == "0" ]; then
 			echo "$nowTime"' '"$senMsg" | tee -a "$logAlert"
@@ -1068,13 +1282,13 @@ expireUserCA() {
 		return 0
 	fi
 
-	if [ "$sftpAccountName" == "all" -a "$sftpCMD" == "check" ]; then
+	if [ "$parameter1" == "all" -a "$parameter2" == "check" ]; then
 		for i in `$0 user get list`; do
 			$0 ca expire "$i" check
 		done
 	fi
 
-	if [ "$sftpAccountName" != "all" -a "$sftpCMD" == "flush" ]; then
+	if [ "$parameter1" != "all" -a "$parameter2" == "flush" ]; then
 		if [ "$formatNow" -ge "$formatExpires" ]; then
 			flag=`grep ^# "$sftpUserKeysDir"'/'"$authorizedKeysName" | wc -l`
 			if [ "$flag" != "0" ]; then
@@ -1113,7 +1327,7 @@ expireUserCA() {
 
 	fi
 
-	if [ "$sftpAccountName" == "all" -a "$sftpCMD" == "flush" ]; then
+	if [ "$parameter1" == "all" -a "$parameter2" == "flush" ]; then
 		for i in `$0 user get list`; do
 			$0 ca expire "$i" flush
 		done
@@ -1122,18 +1336,20 @@ expireUserCA() {
 
 setQuota() {
 	# Function to realize user disk quota
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-	sftpQuota="$parameter3"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 quota set <sftp account> <JR No.> [quota]"
+	if [[ "$parameter1" == "" || "$parameter1" == "" ]]; then
+		echo "Usage: $0 quota set <example.com\loginName> <JR No.> [quota]"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountName"'" first!'
-		exit 1;
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+	sftpQuota="$parameter3"
+
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -1184,27 +1400,28 @@ setQuota() {
 
 getQuota() {
 	# Function to realize user disk quota
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
+	if [ "$parameter1" == "" ]; then
 		echo "Usage: $0 quota get <all>"
-		echo "       $0 quota get <sftp account>"
+		echo "       $0 quota get <example.com\loginName>"
 		echo "       $0 quota get <root>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 	sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
 
-	if [ "$sftpAccountName" == "root" ]; then
+	if [ "$parameter1" == "root" ]; then
 		mountDir="`df -h | grep $quotaPath | awk -F ' ' '{print $6}'`"
 		echo 'Quota Root Directory: '"$quotaPath"
 		echo 'Quota Root Directory Space: '`du -sh "$mountDir" | awk  -F ' '  '{print $1}'`
 	fi
 
-	if [ "$sftpAccountName" != "root" -a "$sftpAccountName" != "all" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" != "root" -a "$parameter1" != "all" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 
         	if [ ! -d "$sftpUserRootDir" ]; then
@@ -1213,13 +1430,14 @@ getQuota() {
 			exit 1;
 		fi
 		quotaMessage=`quota -u "$sftpAccountName" -s -w | grep $quotaPath`
+		echo "$quotaMessage"
 		echo 'User Quota Directory: '"$sftpUserHomeDir"
 		echo 'User Quota Space: '"`echo $quotaMessage | awk -F ' ' '{print $2}'`"
 		echo 'User Quota: '"`echo $quotaMessage | awk -F ' ' '{print $3}'`"
 		echo 'User Quota Limit: '"`echo $quotaMessage | awk -F ' ' '{print $4}'`"
 	fi
 
-	if [ "$sftpAccountName" == "all" ]; then
+	if [ "$parameter1" == "all" ]; then
 		for i in `$0 user get list`; do
 			$0 quota get "$i"
 			echo
@@ -1227,31 +1445,127 @@ getQuota() {
 	fi
 }
 
-setMount() {
-	#The function realizes mounting a user's data directory to another user-specified directory
-	sftpAccountNameFrom="$parameter1"
-	sftpAccountNameTo="$parameter2"
+checkQuota() {
+	# Whether the disk quota of the function user exceeds 90%
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 quota check <all>"
+		echo "       $0 quota check <example.com\loginName>"
+		exit 1;
+	fi
+	if [ "$parameter1" != "all" ]; then
+		sftpAccountName="$(userFormat $parameter1)"
+
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountName"'" does not exist!'
+			exit 1
+		fi
+
+		quotaInfo=$($0 quota get "$sftpAccountName")
+		quotaSpace=$(echo "$quotaInfo" | grep "User Quota Space:" | awk -F':' '{print $2}' | sed 's/ //g' | sed 's/\*//g')
+		quotaLimit=$(echo "$quotaInfo" | grep "User Quota Limit:" | awk -F':' '{print $2}' | sed 's/ //g')
+		quotaSpaceFormat=$(formatQuota "$quotaSpace")
+		quotaLimitFormat=$(formatQuota "$quotaLimit")
+		if [[ $quotaLimitFormat =~ [^0-9] ]]; then
+			exit 1
+		fi
+		percentage=$(awk 'BEGIN{printf "%.1f\n",('$quotaSpaceFormat'/'$quotaLimitFormat')*100}')
+		if (( $(awk 'BEGIN {print ('$percentage' < 90)}') )); then
+			exit 0
+		fi
+
+		userInfo=$($0 ldap get userInfo "$sftpAccountName")
+		mailTo=$(echo "$userInfo" | grep "mail: " | sed 's/mail: //g')
+		userName=$(echo "$userInfo" | grep "sAMAccountName: " | sed 's/sAMAccountName: //g')
+		if [ "$mailTo" == "" ]; then
+			echo "Get $sftpAccountName mail address error, program exit!"
+			exit 1
+		fi
+		if [ "$userName" == "" ]; then
+			echo "Get $sftpAccountName user name error, program exit!"
+			exit 1
+		fi
+		grepMsg=`egrep "$(date '+%Y-%m-%d').*sendQuotaAlert" "$logAlert" | grep "account:$sftpAccountName userTo:$userName mailTo:$mailTo" | wc -l`
+		if [ -f "$logAlert" ]; then
+			if [ $grepMsg -ne 0 ]; then
+    				exit 0
+			fi
+		fi
+		mailSubject="[CMDSCHOOL SFTP] Disk Space Usage Warning - $percentage% Capacity Reached"
+		cat <<-EOF | mail -s "$mailSubject" -r "$mailFrom" "$mailTo"
+		Dear $userName,
+
+		We would like to inform you that your disk space usage on the SFTP server has reached $percentage%.
+		To avoid any disruptions in your service, please consider cleaning up unnecessary files or requesting an increase in your allocated space.
+
+		Current Usage Details:
+
+		Used Space: $quotaSpace
+		Limit Space: $quotaLimit
+		Usage Percentage: $percentage%
+		EOF
+		if [ "$?" == "0" ]; then
+			echo "successfully!"
+			alertMsg='sendQuotaAlert "''account:'"$sftpAccountName"' userTo:'"$userName"' mailTo:'"$mailTo"' quotaUsage:'"$percentage%"'"'
+			if [[ $logDisable == false ]]; then echo "$nowTime"' '"$alertMsg" >> "$logAlert"; fi
+		fi
+	return 0
+	fi
+
+	if [ "$parameter1" == "all" ]; then
+		LOCKFILE="/tmp/sftptool_quota_check_all.lock"
+		if [ -e "$LOCKFILE" ]; then
+			oldPid=$(cat "$LOCKFILE")
+			if [ ! -z "$oldPid" ]; then
+				if ps -p "$oldPid" > /dev/null; then
+					echo "'sftptool quota check all' is already running with PID $oldPid."
+					exit 1
+				fi
+			fi
+			rm -f "$LOCKFILE"
+		fi
+		echo $$ > "$LOCKFILE"
+		for i in `$0 user get list`; do
+			echo "checking $i"
+			$0 quota check "$i"
+		done
+		rm -f "$LOCKFILE"
+	fi
+
+}
+
+setShare() {
+	#The function realizes shareing a user's data directory to another user-specified directory
+	if [[ "$parameter1" == "" || "$parameter2" == "" || "$parameter3" == "" ]]; then
+		echo "Usage: $0 share set <from example.com\loginName> <share to example.com\loginName> <JR No.> [rw]"
+		echo "       $0 share set <from example.com\loginName> <share to example.com\loginName> <JR No.> [ro]"
+		exit 1;
+	fi
+	sftpAccountName="$(userFormat $parameter1)"
+	sftpAccountNameShare="$(userFormat $parameter2)"
 	jrNumber="$parameter3"
-	writeEnable="$parameter4"
+	writeEnable=$(echo "$parameter4" | tr 'A-Z' 'a-z')
 
-	if [[ "$sftpAccountNameFrom" == "" || "$sftpAccountNameTo" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 mount set <from sftp account> <to sftp account> <JR No.> [rw]"
-		echo "       $0 mount set <from sftp account> <to sftp account> <JR No.> [ro]"
-		exit 1;
+	loginCheck "$parameter1"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+		exit 1
 	fi
 
-        if [ `id "$sftpAccountNameFrom" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountNameFrom"'" first!'
-		exit 1;
+	loginCheck "$parameter2"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountNameShare"'" does not exist!'
+		exit 1
 	fi
 
-        if [ `id "$sftpAccountNameTo" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountNameTo"'" first!'
+        if [ "$parameter1" == "$parameter2" ]; then
+		echo "Do not allow yourself to share yourself!"
 		exit 1;
 	fi
-
-        if [ "$sftpAccountNameFrom" == "$sftpAccountNameTo" ]; then
-		echo "Do not allow yourself to mount yourself!"
+	
+	if [ "$writeEnable" != "rw" ] && [ "$writeEnable" != "ro" ]; then
+		echo "Usage: $0 share set <from example.com\loginName> <share to example.com\loginName> <JR No.> [rw]"
+		echo "       $0 share set <from example.com\loginName> <share to example.com\loginName> <JR No.> [ro]"
 		exit 1;
 	fi
 
@@ -1261,18 +1575,11 @@ setMount() {
 		exit 1;
 	fi
 
-	sftpUserRootDirFrom="$sftpDataDir"'/'"$sftpAccountNameFrom"
-	sftpUserHomeDirFrom="$sftpUserRootDirFrom"'/'"$sftpHomeName"
-	sftpUserRootDirTo="$sftpDataDir"'/'"$sftpAccountNameTo"
+	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 
-        if [ ! -d "$sftpUserRootDirFrom" ]; then
-		echo 'Please create user "'"$sftpAccountNameFrom"'" directory first,'
-		echo "$sftpUserRootDirFrom"
-		exit 1;
-	fi
-        if [ ! -d "$sftpUserRootDirTo" ]; then
-		echo 'Please create user "'"$sftpAccountNameTo"'" directory first,'
-		echo "$sftpUserRootDirTo"
+        if [ ! -d "$sftpUserRootDir" ]; then
+		echo 'Please create user "'"$sftpAccountName"'" directory first,'
+		echo "$sftpUserRootDir"
 		exit 1;
 	fi
 
@@ -1280,44 +1587,31 @@ setMount() {
 		writeEnable="ro"
 	fi
 
-	mastConf="/- $autoSftpConf"
-	if [ "`grep "^$mastConf" "$autoMastConf" | wc -l`" != "1" ]; then
-		echo "$mastConf" >> "$autoMastConf"
+	if [ ! -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+		addShareFile "$sftpAccountName"
 	fi
-	mountStr="$sftpUserRootDirTo/mount/$sftpAccountNameFrom -fstype=bind,$writeEnable :$sftpUserHomeDirFrom"
-	grepMountStr="$sftpUserRootDirTo/mount/$sftpAccountNameFrom -fstype=bind,.* :$sftpUserHomeDirFrom"
 
-	if [ "`grep "^$grepMountStr" "$autoSftpConf" | wc -l`" == "0" ]; then
-		echo "$mountStr" >> "$autoSftpConf"
-		systemctl reload autofs.service
-		echo 'Mount "'"$sftpAccountNameFrom"'" home directory to "'"$sftpAccountNameTo"'" was created successfully!'
-		changeMsg='setMount "''jr:'"$jrNumber"' mount:'"$sftpAccountNameFrom home directory to $sftpAccountNameTo"'"'
-		if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
-	else
-		echo 'Mount "'"$sftpAccountNameFrom"'" home directory to "'"$sftpAccountNameTo"'" already exists!'
-	fi
+	$0 share del "$sftpAccountName" "$sftpAccountNameShare" "$jrNumber"
+	echo "$(echo "$sftpAccountNameShare" | awk -F '@' '{print $2 "\\" $1}') $writeEnable" >> "$sftpUserRootDir"'/'"$shareFileName"
+	echo 'setShare "'"jr$jrNumber account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$writeEnable was successfully!"'"'
+	changeMsg='setShare "'"jr:$jrNumber account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$writeEnable"'"'
+	if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
+	return 0
 }
 
-delMount() {
-	#The function realizes mounting a user's data directory to another user-specified directory
-	sftpAccountNameTo="$parameter1"
-	sftpAccountNameFrom="$parameter2"
+delShare() {
+	#The function realizes shareing a user's data directory to another user-specified directory
+	if [[ "$parameter1" == "" || "$parameter2" == "" || "$parameter3" == "" ]]; then
+		echo "Usage: $0 share del <example.com\loginName> <share to example.com\loginName> <JR No.>"
+		echo "       $0 share del <example.com\loginName> <all> <JR No.>"
+		exit 1;
+	fi
+
+	sftpAccountName="$(userFormat $parameter1)"
+	if [ "$parameter2" != "all" ]; then
+		sftpAccountNameShare="$(userFormat $parameter2)"
+	fi
 	jrNumber="$parameter3"
-
-	if [[ "$sftpAccountNameFrom" == "" || "$sftpAccountNameTo" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 mount del <on sftp account> <from sftp account> <JR No.>"
-		echo "       $0 mount del <on sftp account> <all> <JR No.>"
-		exit 1;
-	fi
-       	if [[ "$sftpAccountNameFrom" != "all" && `id "$sftpAccountNameFrom" 2>&1 | grep "no such user" | wc -l` == 1 ]]; then
-		echo 'Please create user "'"$sftpAccountNameFrom"'" first!'
-		exit 1;
-	fi
-
-        if [ `id "$sftpAccountNameTo" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'Please create user "'"$sftpAccountNameTo"'" first!'
-		exit 1;
-	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
 	if ! checkJrRule "$jrNumber"; then
@@ -1325,123 +1619,225 @@ delMount() {
 		exit 1;
 	fi
 
-	sftpUserRootDirFrom="$sftpDataDir"'/'"$sftpAccountNameFrom"
-	sftpUserHomeDirFrom="$sftpUserRootDirFrom"'/'"$sftpHomeName"
-	sftpUserRootDirTo="$sftpDataDir"'/'"$sftpAccountNameTo"
+	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
 
-        if [[ "$sftpAccountNameFrom" != "all" && ! -d "$sftpUserRootDirFrom" ]]; then
-		echo 'Please create user "'"$sftpAccountNameFrom"'" directory first,'
-		echo "$sftpUserRootDirFrom"
-		exit 1;
-	fi
-        if [ ! -d "$sftpUserRootDirTo" ]; then
-		echo 'Please create user "'"$sftpAccountNameTo"'" directory first,'
-		echo "$sftpUserRootDirTo"
-		exit 1;
-	fi
+	if [ "$parameter2" != "all" ]; then
+		loginCheck "$parameter1"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountName"'" does not exist!'
+			exit 1
+		fi
+		loginCheck "$parameter2"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountNameShare"'" does not exist!'
+			exit 1
+		fi
+        	if [ ! -d "$sftpUserRootDir" ]; then
+			echo 'Please create user "'"$sftpAccountName"'" directory first,'
+			echo "$sftpUserRootDir"
+			exit 1
+		fi
+		if [ ! -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+			echo "Failed to find the shared configuration file '"$sftpUserRootDir'/'$shareFileName"'."
+			exit 1
+		fi
 
-	mountStr="$sftpUserRootDirTo/mount/$sftpAccountNameFrom -fstype=bind,.* :$sftpUserHomeDirFrom"
-	uMountStr="$sftpUserRootDirTo/mount/$sftpAccountNameFrom"
-
-	if [ "$sftpAccountNameFrom" != "all" ]; then
-		if [ "`grep "^$mountStr" "$autoSftpConf" | wc -l`" -ge "1" ]; then
-			sed -i "s#$mountStr##g" "$autoSftpConf"
-			sed -i '/^$/d' "$autoSftpConf"
-			systemctl reload autofs.service
-			for ((;;)); do
-				if [ "`mount | grep "$uMountStr" | wc -l`" -ge "1" ]; then
-					umount -lf "$uMountStr" > /dev/null 2>&1
-				else
-					break
-				fi
-			done
-
-			if [ -d "$uMountStr" ]; then
-				rm -rf "$uMountStr"
-			fi
-			echo 'delMount "'"$sftpAccountNameFrom"'" on "'"$sftpAccountNameTo"'" was successfully!'
-			changeMsg='delMount "''jr:'"$jrNumber"' mount:'"$sftpAccountNameFrom on $sftpAccountNameTo"'"'
+		shareList=$(egrep -in "$(echo "$sftpAccountNameShare" | awk -F '@' '{print $2 "\\\\" $1}')" "$sftpUserRootDir"'/'"$shareFileName" | sort -k1 -rn)
+		IFS=$'\n'
+		for i in $shareList; do
+			delItem=$(echo $i | cut -d ":" -f1)
+			writeEnable=$(echo $i | cut -d ":" -f2 | cut -d " " -f2)
+			sed -i "${delItem}d" "$sftpUserRootDir"'/'"$shareFileName"
+			echo 'delShare "'"jr$jrNumber account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$writeEnable was successfully!"'"'
+			changeMsg='delShare "'"jr:$jrNumber account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$writeEnable"'"'
 			if [[ $logDisable == false ]]; then echo "$nowTime"' '"$changeMsg" >> "$logChange"; fi
-		else
-			echo 'delMount "'"$sftpAccountNameFrom"'" on "'"$sftpAccountNameTo"'" no found!'
-		fi
+		done
+
 	fi
 
-	if [[ "$sftpAccountNameFrom" == "all" ]]; then
-		$0 mount get "$sftpAccountNameTo" > /dev/null
-		if [ $? == 0 ]; then
-			for i in `$0 mount get "$sftpAccountNameTo"  | cut -d" " -f1 | awk -F '/'  '{print $(NF-1)}'`; do
-				$0 mount del "$sftpAccountNameTo" "$i" "$jrNumber"
-			done
+	if [[ "$parameter2" == "all" ]]; then
+		if [ ! -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+			echo "Failed to find the shared configuration file '"$sftpUserRootDir'/'$shareFileName"'."
+			exit 1
 		fi
+		for i in `egrep -v "^$|^#" "$sftpUserRootDir"'/'"$shareFileName" | cut -d " " -f1`; do
+			$0 share del "$sftpAccountName" "$i" "$jrNumber"
+		done
 	fi
 }
 
-getMount() {
-	#The function realizes mounting a user's data directory to another user-specified directory
-	sftpAccountNameTo="$parameter1"
-	sftpAccountNameFrom="$parameter2"
-
-	if [ "$sftpAccountNameTo" == "" ]; then
-		echo "Usage: $0 mount get <all>"
-		echo "       $0 mount get <on sftp account> [from sftp account]"
+getShare() {
+	#The function realizes shareing a user's data directory to another user-specified directory
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 share get <all>"
+		echo "       $0 share get <example.com\loginName>"
 		exit 1;
 	fi
 
-	if [ "$sftpAccountNameTo" != "all" ]; then
-        	if [ `id "$sftpAccountNameTo" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-			echo 'Please create user "'"$sftpAccountNameTo"'" first!'
-			exit 1;
+	sftpAccountName="$(userFormat $parameter1)"
+
+	if [ "$parameter1" != "all" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountName"'" does not exist!'
+			exit 1
 		fi
 
-		sftpUserRootDirFrom="$sftpDataDir"'/'"$sftpAccountNameFrom"
-		sftpUserHomeDirFrom="$sftpUserRootDirFrom"'/'"$sftpHomeName"
-		sftpUserRootDirTo="$sftpDataDir"'/'"$sftpAccountNameTo"
-		sftpUserHomeDirTo="$sftpUserRootDirTo"'/'"$sftpHomeName"
-
-		if [ "$sftpAccountNameFrom" == "" ]; then
-			mountStr="$sftpUserRootDirTo/mount/.* -fstype=bind,.* :.*"
+		sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
+		if [ -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+			egrep -v "^$|^#" "$sftpUserRootDir"'/'"$shareFileName"
 		else
-			mountStr="$sftpUserRootDirTo/mount/$sftpAccountNameFrom -fstype=bind,.* :$sftpUserHomeDirFrom"
-		fi
-
-		if [ "`grep "^$mountStr" "$autoSftpConf" | wc -l`" -lt "1" ]; then
-			echo 'Mount point does not exist for user "'"$sftpAccountNameTo"'"'
-			exit 1;
-		else
-			IFS=$'\n'
-			for i in `grep "^$mountStr" "$autoSftpConf"`; do
-				sftpUserHomeDirFrom=`echo "$i" | cut -d" " -f3 | sed 's~:~~g'`
-				sftpUserHomeDirTo=`echo "$i" | cut -d" " -f1`
-				rwStatus=`echo "$i" | cut -d" " -f2 | cut -d"," -f2`
-				echo "$sftpUserHomeDirFrom on $sftpUserHomeDirTo ($rwStatus)"
-			done
-			exit 0;
+			echo "Failed to find the shared configuration file '"$sftpUserRootDir'/'$shareFileName"'."
+			exit 1
 		fi
 	fi
 
-	if [[ "$sftpAccountNameTo" = "all" ]]; then
-		IFS=$'\n'
-		for i in `cat "$autoSftpConf" | cut -d" " -f1`; do
-			sftpAccountNameTo=`echo "$i" | awk -F '/'  '{print $(NF-2)}'`
-			sftpAccountNameFrom=`echo "$i" | awk -F '/'  '{print $NF}'`
-			$0 mount get "$sftpAccountNameTo" "$sftpAccountNameFrom"
+	if [[ "$parameter1" = "all" ]]; then
+		for i in `$0 user get list`; do
+			$0 share get "$i"
+			echo
 		done
 		return 0
 	fi
 }
 
-bakUserCA() {
-	#Function to manually back up user certificates.
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 ca backup <sftp account>"
+scanShare() {
+	# Function to monitor changes in user shared directory configuration files
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 share scan <example.com\loginName>"
+		echo "       $0 share scan <all>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
-		echo 'User "'"$sftpAccountName"'" does not exist!'
+	if [ "$parameter1" != "all" ]; then
+		sftpAccountName="$(userFormat $parameter1)"
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountName"'" does not exist!'
+			exit 1
+		fi
+
+		sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
+		sftpUserHomeDir="$sftpUserRootDir"'/'"$sftpHomeName"
+
+		if [ -f "$sftpUserRootDir"'/'"$shareFileName" ]; then
+			shares=$(egrep -v "^$|^#" "$sftpUserRootDir"'/'"$shareFileName")
+		else
+			return 1
+		fi
+		# check and add new share config
+		IFS=$'\n'
+		for share in $shares; do
+			share=$(echo "$share" | sed 's/^[ \t]*//g' | sed 's/[ \t]*$//g')
+			sftpAccountNameShare=$(userFormat "`echo "$share" | cut -d" " -f1`" | awk '{print tolower($0)}')
+			sharePermission=$(echo "$share" | cut -d" " -f2 | awk '{print tolower($0)}')
+
+			loginCheck "$sftpAccountNameShare"
+			if [ "$?" -ne "0" ]; then
+				echo 'User "'"$sftpAccountNameShare"'" does not exist!'
+				continue
+			fi
+
+			if [[ "$sharePermission" != "rw" && "$sharePermission" != "ro" ]]; then
+				continue
+			fi
+
+			if [ "$sftpAccountNameShare" = "$sftpAccountName" ]; then
+				continue
+			fi
+
+			mountConfig='"'"$sftpDataDir"'/'"$sftpAccountNameShare"'/share/'"$sftpAccountName"'" -fstype=bind,'".*"' ":'"$sftpUserHomeDir"'"'
+			oldMountConfig=`egrep "$mountConfig" "$autoSftpConf"`
+			mountConfig='"'"$sftpDataDir"'/'"$sftpAccountNameShare"'/share/'"$sftpAccountName"'" -fstype=bind,'"$sharePermission"' ":'"$sftpUserHomeDir"'"'
+			if [ "$oldMountConfig" = "" ]; then
+				echo "$mountConfig" >> "$autoSftpConf"
+				echo 'addAutoFSConf "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission was successfully!"'"'
+				logMsg='addAutoFSConf "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission"'"'
+				if [[ $logDisable == false ]]; then echo "$nowTime"' '"$logMsg" >> "$logMessage"; fi
+			else
+				if [ "$oldMountConfig" = "$mountConfig" ]; then
+					continue
+				fi
+				umount -lf "$sftpDataDir"'/'"$sftpAccountNameShare"'/share/'"$sftpAccountName"
+				sed -i "s~$oldMountConfig~$mountConfig~g" "$autoSftpConf"
+				echo 'updateAutoFSConf "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission was successfully!"'"'
+				logMsg='updateAutoFSConf "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission"'"'
+				if [[ $logDisable == false ]]; then echo "$nowTime"' '"$logMsg" >> "$logMessage"; fi
+			fi
+		done
+		# check and del old share config
+		for autoConf in `egrep ":.*$sftpAccountName.*" "$autoSftpConf"`; do
+			sftpAccountNameShare=$(echo "$autoConf" | cut -d" " -f1 | cut -d"/" -f4 | awk -F "@" '{print $2"\\"$1}')
+			sharePermission=$(echo "$autoConf" | cut -d" " -f2 | cut -d"," -f2)
+			share="$sftpAccountNameShare $sharePermission"
+			wcShareConfig=$(egrep -v "^$|^#" "$sftpUserRootDir"'/'"$shareFileName" | egrep -i "`echo "$share" | awk -F '\' '{print $1"\\\\\\\\"$2}'`" | wc -l)
+			if [ "$wcShareConfig" -ne "0" ]; then
+				continue
+			fi
+			sed -i "$(grep -n "$autoConf" "$autoSftpConf" | cut -d":" -f1)d" $autoSftpConf
+			sftpAccountNameShare=$(userFormat "$sftpAccountNameShare")
+			umount -lf "$sftpDataDir"'/'"$sftpAccountNameShare"'/share/'"$sftpAccountName"
+			echo 'delShareAutoFS "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission was successfully!"'"'
+			logMsg='delShareAutoFS "'"account:$sftpAccountName share to:$sftpAccountNameShare Permissions:$sharePermission"'"'
+			if [[ $logDisable == false ]]; then echo "$nowTime"' '"$logMsg" >> "$logMessage"; fi
+		done
+	fi
+
+	if [ "$parameter1" == "all" ]; then
+		LOCKFILE="/tmp/sftptool_share_scan_all.lock"
+		if [ -e "$LOCKFILE" ]; then
+			oldPid=$(cat "$LOCKFILE")
+			if [ ! -z "$oldPid" ]; then
+				if ps -p "$oldPid" > /dev/null; then
+					echo "'sftptool share scan all' is already running with PID $oldPid."
+					exit 1
+				fi
+			fi
+			rm -f "$LOCKFILE"
+		fi
+		echo $$ > "$LOCKFILE"
+
+		oldMd5=$(egrep "reloadAutoFS .*config:$autoSftpConf md5sum:.*" "$logMessage" | tail -n1 | awk -F 'md5sum:' '{print $2}' | sed 's/"$//g')
+		restartFlag=0
+		for i in `ls "$sftpDataDir"`; do
+			if [ ! -d "$sftpDataDir/$i" ]; then continue; fi
+			echo scaning "$i"
+			$0 share scan "$i"
+                done
+
+		newMd5=$(md5sum "$autoSftpConf" | cut -d" " -f1)
+		if [ "$oldMd5" == "" ]; then
+			restartFlag=1
+		fi
+		if [ "$oldMd5" != "$newMd5" ]; then
+			restartFlag=2
+		fi
+
+		if [ "$restartFlag" != "0" ]; then
+			systemctl reload autofs.service
+			echo 'reloadAutoFS "'"config:$autoSftpConf md5sum:$newMd5 was successfully!"'"'
+			logMsg='reloadAutoFS "'"config:$autoSftpConf md5sum:$newMd5"'"'
+			if [[ $logDisable == false ]]; then echo "$nowTime"' '"$logMsg" >> "$logMessage"; fi
+		fi
+		rm -f "$LOCKFILE"
+	fi
+	return 0
+
+}
+
+bakUserCA() {
+	#Function to manually back up user certificates.
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 ca backup <example.com\loginName>"
 		exit 1;
+	fi
+
+	sftpAccountName="$(userFormat $parameter1)"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+		exit 1
 	fi
 
         if [ ! -d "$backupDir" ]; then
@@ -1471,16 +1867,18 @@ bakUserCA() {
 
 bakUserHome() {
 	#Function to manually backup user home data.
-	sftpAccountName="$parameter1"
 
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 home backup <sftp account>"
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 home backup <example.com\loginName>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	sftpUserRootDir="$sftpDataDir"'/'"$sftpAccountName"
@@ -1516,15 +1914,17 @@ bakUserHome() {
 
 bakUser() {
 	#Function to manually backup user home data.
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 user backup <sftp account>"
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 user backup <example.com\loginName>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
         if [ ! -d "$backupDir" ]; then
@@ -1567,33 +1967,34 @@ bakUser() {
 
 getBackup() {
 	# Function implementation to get user list
-	sftpAccountName="$parameter1"
-	if [ "$sftpAccountName" == "" ]; then
+	if [ "$parameter1" == "" ]; then
 		echo "Usage: $0 backup get <list>"
-		echo "       $0 backup get <sftp account>"
+		echo "       $0 backup get <example.com\loginName>"
 		echo "       $0 backup get <all>"
 		echo "       $0 backup get <root>"
 		exit 1;
 	fi
 
+	sftpAccountName="$(userFormat $parameter1)"
         if [ ! -d "$backupDir" ]; then
                 echo 'Backup storage directory '"$backupDir"' does not exist'
                 exit 1;
         fi
 
-	if [ "$sftpAccountName" == "root" ]; then
+	if [ "$parameter1" == "root" ]; then
 		echo 'Backup Root Directory Path: '"$backupDir"
 		echo 'Backup Root Directory Space: '`du -sh "$backupDir" | awk  -F ' '  '{print $1}'`
 	fi
 
-	if [ "$sftpAccountName" == "list" ]; then
+	if [ "$parameter1" == "list" ]; then
 		ls "$backupDir"'/'*'_sftpd_'*'.tar.bz2'
 	fi
 
-	if [ "$sftpAccountName" != "list" -a "$sftpAccountName" != "all" -a "$sftpAccountName" != "root" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" != "list" -a "$parameter1" != "all" -a "$parameter1" != "root" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
 		fi
 		listMessage=`ls "$backupDir"'/'"$sftpAccountName"'_sftpd_'*'.tar.bz2' 2>&1`
 		if [ `echo "$listMessage" | grep "No such file or directory" | wc -l` == "0" ]; then
@@ -1603,7 +2004,7 @@ getBackup() {
 		fi
 	fi
 
-	if [ "$sftpAccountName" == "all" ]; then
+	if [ "$parameter1" == "all" ]; then
 		for i in `$0 user get list`; do
 			$0 backup get "$i"
 			if [ "$?" == "0" ]; then
@@ -1615,17 +2016,17 @@ getBackup() {
 
 recoverUserCA() {
 	#Function to realize the recovery of user certificate
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 ca recover <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 ca recover <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -1668,17 +2069,18 @@ recoverUserCA() {
 
 recoverUserHome() {
 	#Function to realize the recovery of user home
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$sftpAccountName" == "" ]]; then
-		echo "Usage: $0 home recover <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 home recover <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
+
+	loginCheck "$sftpAccountName"
+	if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
+		exit 1
 	fi
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
@@ -1721,13 +2123,13 @@ recoverUserHome() {
 
 recoverUser() {
 	#Function to realize the recovery of user home
-	sftpAccountName="$parameter1"
-	jrNumber="$parameter2"
-
-	if [[ "$sftpAccountName" == "" || "$jrNumber" == "" ]]; then
-		echo "Usage: $0 user recover <sftp account> <JR No.>"
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 user recover <example.com\loginName> <JR No.>"
 		exit 1;
 	fi
+
+	sftpAccountName="$(userFormat $parameter1)"
+	jrNumber="$parameter2"
 
 	jrNumber="`echo "$jrNumber" | tr 'a-z' 'A-Z'`"
 	if ! checkJrRule "$jrNumber"; then
@@ -1747,7 +2149,7 @@ recoverUser() {
 		case "$choice" in 
 		y|Y )
 			echo "yes"
-			useradd "$sftpAccountName" -g "$sftpGroupName" -M -d '/'"$sftpHomeName" -s /bin/false
+			echo useradd "$sftpAccountName" -g "$domainGroupName" -M -d '/'"$sftpHomeName" -s /bin/false
 			echo "$sftpPasswd" | passwd --stdin "$sftpAccountName"
 		        ;;
 		n|N )
@@ -1799,20 +2201,19 @@ recoverUser() {
 
 sendUserCA() {
 	# Function implementation to send a certificate to the user
-
-	sftpAccountName="$parameter1"
-	sftpUserName="$parameter2"
-	sftpUserMail="$parameter3"
-
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 ca send <sftp account> [userName] [userMail]"
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 ca send <loginName@example.com> [userMail]"
 		exit 1;
 	fi
 
-        if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	sftpAccountName="$(userFormat $parameter1)"
+	sftpUserMail="$parameter2"
+
+        loginCheck "$sftpAccountName"
+        if [ "$?" -ne "0" ]; then
 		echo 'User "'"$sftpAccountName"'" does not exist!'
-		exit 1;
-	fi
+                exit 1
+        fi
 
 	sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
 	sftpUserKeysDir="$sftpUserKeysRootDir"'/.ssh'
@@ -1830,15 +2231,11 @@ sendUserCA() {
 		echo 'Could not find user key file: '"$linuxPathKey"
 		error=1
 	fi
-	if [ ! -f "$sftpUserInfo" ]; then
-		echo 'Could not find user user info file: '"$sftpUserInfo"
-		error=1
-	fi
 	if [ $error != 0 ]; then
 		exit 1
 	fi
 
-	sftpUserMail=`cat "$sftpUserInfo" | grep "mail: " | sed 's/mail: //g'`
+	sftpUserMail=`$0 ldap get userInfo "$sftpAccountName" | grep "mail: " | sed 's/mail: //g'`
 	if [ "$sftpUserMail" == "" ]; then
 		read -p 'Please enter email address of account "'"$sftpAccountName"'": ' mailTo
 	else
@@ -1859,7 +2256,7 @@ sendUserCA() {
 		exit 1
 	fi
 	endUserStaffNumber=`cat "$sftpUserInfo" | grep "staff: " | sed 's/staff: //g'`
-	userName=`$0 ldap get "$endUserStaffNumber" cn | grep "cn: " | sed 's/cn: //g'`
+	userName=`$0 ldap get userInfo "$sftpAccountName" displayName | grep "displayName: " | sed 's/displayName: //g'`
 	if [ "$userName" == "" ]; then
 		read -p 'Please enter user name of user "'"$sftpAccountName"'": ' var
 		userName="`echo $var | tr 'a-z' 'A-Z'`"
@@ -1893,13 +2290,13 @@ sendUserCA() {
 		attachmentList="-a $linuxPathKey -a $fileZillaPathKey"
 	fi
 
-	mailSubject='[SFTP Service] SFTP account is ready – ['"$jrNumber"']'
+	mailSubject='[CMDSCHOOL SFTP] SFTP account is ready – ['"$jrNumber"']'
 	cat <<-EOF | mail -s "$mailSubject" `echo $attachmentList` -r "$mailFrom" "$mailTo"
 	Dear $userName
 
 	The SFTP account has been successfully created with the JR:$jrNumber. Please use the below credentials for SFTP services and keep confidential.
 
-	Username: $sftpAccountName
+	Username: $(echo "$sftpAccountName" | awk -F '@' '{print $2 "\\" $1}')
 	Secret key: `echo $sftpAccountName`_rsa.ppk (please download from the attachment)
 
 	Please refer to the detailed User Guide below.
@@ -1907,9 +2304,9 @@ sendUserCA() {
 	https://pvtcloud.cmdschool.org/index.php/s/dx7ry7LFaStADDc
 
 	You may contact IT HelpDesk, if you need further assistance or queries. 
-	IT Helpdesk: (xx) xxxx
+	HK IT Helpdesk: (31) 8222; D2 IT Helpdesk: (32)2998; CA IT Helpdesk: (33)7998
 
-	Note: This email is an automatically generated email from [SFTP Service], please do not respond to this email, and delete immediately after saving the credentials!
+	Note: This email is an automatically generated email from [CMDSCHOOL SFTP], please do not respond to this email, and delete immediately after saving the credentials!
 
 	EOF
 	if [ "$?" == "0" ]; then
@@ -1920,59 +2317,111 @@ sendUserCA() {
 	return 0
 }
 
-getLdap() {
-	# Function implementation to get user list
-	sftpStaffNO="$parameter1"
-	sftpStaffAtt="$parameter2"
-
-	ldapAtt='title:|sn:|telexNumber:|telephoneNumber:|cn:|extentionlocation:|mail:|uid:|deptname:|givenName:'
-	if [ "$sftpStaffNO" == "" ]; then
-		echo "Usage: $0 ldap get <endUser staff No.> [attribute1 attribute2]"
+checkUserPasswd() {
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 ldap check <example.com\loginName>"
 		echo
-		echo 'Attribute Values: "'"`echo $ldapAtt | tr -d ':' | tr '|' ' '`"'"'
 		exit 1;
+
 	fi
 
-	ldapFilter='(&(|(objectclass=person))(|(uid='$sftpStaffNO')))'
+	sftpAccountName="$(userFormat $parameter1)"
+        loginCheck "$sftpAccountName"
+        if [ "$?" -ne "0" ]; then
+		echo 'User "'"$sftpAccountName"'" does not exist!'
+                exit 1
+        fi
 
-	if [ "$sftpStaffAtt" != "" ]; then
-		for i in `echo "$sftpStaffAtt"`; do
-			if [ `echo "$ldapAtt" | grep "$i" | wc -l` == "0" ]; then
-				echo 'Cannot find attribute "'"$i"'"'
-				exit 1
-			fi
-		done
-	fi
+	sftpUserKeysRootDir="$authorizedKeysRootDir"'/'"$sftpAccountName"
+	sftpUserKeysDir="$sftpUserKeysRootDir"'/.ssh'
+	sftpUserInfo="$sftpUserKeysRootDir"'/'"$sftpUserInfoFileName"
 
-	ldapUserInfo="`ldapsearch -x -h "$ldapHost" -p "$ldapPort" -w "$ldapPasswd" -D "$ldapBindDN" -b "$ldapBaseDN" "$ldapFilter" | egrep "$ldapAtt"`"
+	userPasswordSave=`cat "$sftpUserInfo" | grep "userInitialPassword: " | sed 's/userInitialPassword: //g'`
+	userPassword=`echo "$userPasswordSave" | base64 -d`
 
-	if [ "$sftpStaffAtt" != "" ]; then
-		for i in `echo "$sftpStaffAtt"`; do
-			echo "$ldapUserInfo" | grep "$i"
-		done
+	staffName=$(echo "$sftpAccountName" | cut -d "@" -f1)
+	domain=$(echo "$sftpAccountName" | cut -d "@" -f2)
+	ldapFilter="(&(sAMAccountName=$staffName)(objectCategory=person))"
+	searchAdminStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "${ldap[$domain.Passwd]}" -D "${ldap[$domain.BindDN]}" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
+	adminDN=$(echo -E "$searchAdminStr"  | grep dn: | cut -d":" -f2 | sed 's/^ //g')
+	searchUserStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "$userPassword" -D "$adminDN" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
+	userDN=$(echo -E "$searchUserStr" 2> /dev/null | grep dn: | cut -d":" -f2 | sed 's/^ //g')
+	if [ "$adminDN" = "$userDN" ]; then
+		return 0
 	else
-		echo "$ldapUserInfo"
+		return 1
 	fi
 }
 
-getLog() {
-	sftpAccountName="$parameter1"
-
-	if [ "$sftpAccountName" == "" ]; then
-		echo "Usage: $0 log get <sftp account>"
-		echo "       $0 log get <all>"
+getLdapInfo() {
+	# Function implementation to get user list
+	ldapAtt='title:|sn:|telexNumber:|telephoneNumber:|cn:|physicalDeliveryOfficeName:|mail:|sAMAccountName:|department:|displayName:'
+	if [[ "$parameter1" == "" || "$parameter2" == "" ]]; then
+		echo "Usage: $0 ldap get <userInfo> <example.com\loginName> [attribute1 attribute2]"
+		echo '          Attribute Values: "'"`echo $ldapAtt | tr -d ':' | tr '|' ' '`"'"'
+		echo "Usage: $0 ldap get <sftpUsers> <example.com>"
+		echo
 		exit 1;
 	fi
 
-	if [ "$sftpAccountName" != "all" ]; then
-        	if [ `id "$sftpAccountName" 2>&1 | grep "no such user" | wc -l` == 1 ]; then
+	if [ "$parameter1" = "sftpUsers" ]; then
+		domain="$parameter2"
+		ldapFilter="(CN=$sftpGroupName)"
+		searchAdminStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "${ldap[$domain.Passwd]}" -D "${ldap[$domain.BindDN]}" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
+		ldapUsers=$(echo -E "$searchAdminStr" | grep member: | cut -d ":" -f2 | cut -d"," -f1 | sed 's/^[ \t]*//g')
+		IFS=$'\n'
+		for i in $ldapUsers; do
+			searchAdminStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "${ldap[$domain.Passwd]}" -D "${ldap[$domain.BindDN]}" -b "${ldap[$domain.BaseDN]}" "($i)")
+			userName=$(echo -E "$searchAdminStr"  | grep userPrincipalName: | cut -d ":" -f2 | sed 's/^[ \t]*//g')
+			echo $userName
+		done
+	fi
+
+	if [ "$parameter1" = "userInfo" ]; then
+		sftpAccountName="$(userFormat $parameter2)"
+		sftpStaffAtt="$parameter3"
+
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
 			echo 'User "'"$sftpAccountName"'" does not exist!'
-			exit 1;
+			exit 1
+		fi
+		sftpStaffNO=$(echo "$sftpAccountName" | cut -d'@' -f1)
+		domain=$(echo "$sftpAccountName" | cut -d'@' -f2)
+
+		ldapFilter='(&(sAMAccountName='$sftpStaffNO')(objectCategory=person))'
+		searchAdminStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "${ldap[$domain.Passwd]}" -D "${ldap[$domain.BindDN]}" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
+		ldapUserInfo=$(echo -E "$searchAdminStr" |  egrep "$ldapAtt")
+		if [ "$sftpStaffAtt" != "" ]; then
+			for i in `echo "$sftpStaffAtt"`; do
+				echo "$ldapUserInfo" | grep "$i"
+			done
+		else
+			echo "$ldapUserInfo"
+		fi
+	fi
+	return 0
+}
+
+getLog() {
+
+	if [ "$parameter1" == "" ]; then
+		echo "Usage: $0 log get <example.com\loginName>"
+		echo "       $0 log get <all>"
+		exit 1;
+	fi
+	sftpAccountName="$(userFormat $parameter1)"
+
+	if [ "$sftpAccountName" != "all" ]; then
+		loginCheck "$sftpAccountName"
+		if [ "$?" -ne "0" ]; then
+			echo 'User "'"$sftpAccountName"'" does not exist!'
+			exit 1
 		fi
 		ausearch -ue `id -u $sftpAccountName` -i
 	fi
 	if [ "$sftpAccountName" == "all" ]; then
-		ausearch -ge `getent group "$sftpGroupName" | cut -d: -f3` -i
+		ausearch -ge `getent group "$domainGroupName" | cut -d: -f3` -i
 	fi
 }
 
@@ -2073,34 +2522,43 @@ case "$1" in
 			get)
 				getQuota
 				;;
+			check)
+				checkQuota
+				;;
 			*)
-				echo "Usage: $0 quota {set|get}"
+				echo "Usage: $0 quota {set|get|check}"
 				;;
 		esac
 		;;
-	mount)
+	share)
 		case "$2" in 
 			set)
-				setMount
+				setShare
 				;;
 			del)
-				delMount
+				delShare
 				;;
 			get)
-				getMount
+				getShare
+				;;
+			scan)
+				scanShare
 				;;
 			*)
-				echo "Usage: $0 mount {set|get|del}"
+				echo "Usage: $0 share {set|get|del|scan}"
 				;;
 		esac
 		;;
 	ldap)
 		case "$2" in 
 			get)
-				getLdap
+				getLdapInfo
+				;;
+			check)
+				checkUserPasswd
 				;;
 			*)
-				echo "Usage: $0 ldap {get}"
+				echo "Usage: $0 ldap {get|check}"
 				;;
 		esac
 		;;
@@ -2125,6 +2583,6 @@ case "$1" in
 		esac
 		;;
 	*)
-		echo "Usage: $0 {user|home|ca|passwd|quota|mount|log|ldap|backup}"
+		echo "Usage: $0 {user|home|ca|passwd|quota|share|log|ldap|backup}"
     		;;
 esac

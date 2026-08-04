@@ -17,12 +17,12 @@
 ## 3.2 工具安装部署
 重要说明：工具源码下载地址为境外链接，当前无法正常访问，可等待链接恢复后执行以下完整部署命令，完成工具安装、权限配置、配置文件部署：
 ~~~
-# wget https://codeload.github.com/tanzhenchao/sftptool/zip/refs/heads/sftptool-for-ad-user -O sftptool.zip
-# unzip sftptool.zip
-# mv sftptool-sftptool-for-ad-user/sftptool.sh /bin/sftptool
+# wget https://codeload.github.com/tanzhenchao/sftptool/zip/refs/heads/for-ad-user -O sftptool-for-ad-user.zip
+# unzip sftptool-for-ad-user
+# mv sftptool-for-ad-user/sftptool.sh /bin/sftptool
 # chmod +x /bin/sftptool
 # mkdir -p /etc/sftp
-# mv sftptool-sftptool-for-ad-user/sftptool.conf /etc/sftp/sftptool.conf
+# mv sftptool-for-ad-user/sftptool.conf /etc/sftp/sftptool.conf
 ~~~
 ## 3.3 工具运行与命令说明
 安装完成后，直接执行以下命令启动工具：

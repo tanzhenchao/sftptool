@@ -235,7 +235,7 @@ addUser() {
 	adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
 	if [ "$addLdapUserStatus" == "true" ]; then
 		if [ "$sftpPasswd" == "" ]; then
-			sftpPasswd=`mkpasswd-expect -l 10`
+			sftpPasswd=`mkpasswd-expect -l 16`
 		fi
 		echo "${ldap[$userDomain.Passwd]}" | adcli create-user -D "$userDomain" -U "$adminUserName" --mail="$userMail" --stdin-password "$userName"
 	fi
@@ -583,7 +583,7 @@ resetUserPasswd() {
 	fi
 
 	if [ "$sftpPasswd" == "" ]; then
-		sftpPasswd=`mkpasswd-expect -l 10`
+		sftpPasswd=`mkpasswd-expect -l 16`
 	fi
 	adminUserName=$(echo "${ldap[$userDomain.BindDN]}" | cut -d ',' -f1 | cut -d '=' -f2)
 	expect <<-EOF
@@ -1430,7 +1430,6 @@ getQuota() {
 			exit 1;
 		fi
 		quotaMessage=`quota -u "$sftpAccountName" -s -w | grep $quotaPath`
-		echo "$quotaMessage"
 		echo 'User Quota Directory: '"$sftpUserHomeDir"
 		echo 'User Quota Space: '"`echo $quotaMessage | awk -F ' ' '{print $2}'`"
 		echo 'User Quota: '"`echo $quotaMessage | awk -F ' ' '{print $3}'`"
@@ -1503,6 +1502,12 @@ checkQuota() {
 		Used Space: $quotaSpace
 		Limit Space: $quotaLimit
 		Usage Percentage: $percentage%
+
+		If you have any questions or need assistance, feel free to reach out.
+
+		Thank you for your attention to this matter.
+
+		Note: This email is an automatically generated email from [CMDSCHOOL SFTP], please do not respond to this email.
 		EOF
 		if [ "$?" == "0" ]; then
 			echo "successfully!"
@@ -2341,12 +2346,8 @@ checkUserPasswd() {
 
 	staffName=$(echo "$sftpAccountName" | cut -d "@" -f1)
 	domain=$(echo "$sftpAccountName" | cut -d "@" -f2)
-	ldapFilter="(&(sAMAccountName=$staffName)(objectCategory=person))"
-	searchAdminStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "${ldap[$domain.Passwd]}" -D "${ldap[$domain.BindDN]}" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
-	adminDN=$(echo -E "$searchAdminStr"  | grep dn: | cut -d":" -f2 | sed 's/^ //g')
-	searchUserStr=$(ldapsearch -x -h "${ldap[$domain.Host]}" -p "${ldap[$domain.Port]}" -w "$userPassword" -D "$adminDN" -b "${ldap[$domain.BaseDN]}" "$ldapFilter")
-	userDN=$(echo -E "$searchUserStr" 2> /dev/null | grep dn: | cut -d":" -f2 | sed 's/^ //g')
-	if [ "$adminDN" = "$userDN" ]; then
+	ldapwhoami -x -H ldap://"${ldap[$domain.Host]}":"${ldap[$domain.Port]}" -D "$staffName@$domain" -w "$userPassword" >/dev/null 2>&1
+	if [ $? -eq 0 ]; then
 		return 0
 	else
 		return 1

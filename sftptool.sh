@@ -2346,11 +2346,16 @@ checkUserPasswd() {
 
 	staffName=$(echo "$sftpAccountName" | cut -d "@" -f1)
 	domain=$(echo "$sftpAccountName" | cut -d "@" -f2)
-	ldapwhoami -x -H ldap://"${ldap[$domain.Host]}":"${ldap[$domain.Port]}" -D "$staffName@$domain" -w "$userPassword" >/dev/null 2>&1
-	if [ $? -eq 0 ]; then
-		return 0
+	if [ "${ldap[$domain.Editable]}" = "false" ]; then
+			return 0
+	fi
+	resultMsg=$(ldapwhoami -x -H ldap://"${ldap[$domain.Host]}":"${ldap[$domain.Port]}" -D "$staffName@$domain" -w "$userPassword" 2>&1)
+	if echo "$resultMsg" | grep -q '^u:'; then
+			return 0
+	elif echo "$resultMsg" | grep -q 'data 531'; then
+			return 0
 	else
-		return 1
+			return 1
 	fi
 }
 

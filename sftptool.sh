@@ -2346,9 +2346,6 @@ checkUserPasswd() {
 
 	staffName=$(echo "$sftpAccountName" | cut -d "@" -f1)
 	domain=$(echo "$sftpAccountName" | cut -d "@" -f2)
-	if [ "${ldap[$domain.Editable]}" = "false" ]; then
-			return 0
-	fi
 	resultMsg=$(ldapwhoami -x -H ldap://"${ldap[$domain.Host]}":"${ldap[$domain.Port]}" -D "$staffName@$domain" -w "$userPassword" 2>&1)
 	if echo "$resultMsg" | grep -q '^u:'; then
 			return 0
